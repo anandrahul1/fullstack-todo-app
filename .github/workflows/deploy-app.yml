@@ -1,0 +1,289 @@
+name: Todo App - Application Deployment
+
+on:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - 'aws-deployment/**'
+      - '.github/workflows/infrastructure.yml'
+      - 'README.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      force_deploy:
+        description: 'Force new deployment'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  AWS_REGION: us-east-1
+  APP_NAME: todo-app
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm run test:unit
+
+      - name: Run integration tests
+        run: npm run test:integration
+
+  build-and-deploy:
+    name: Build and Deploy Application
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name != 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set environment
+        id: set-env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get infrastructure outputs
+        id: infra
+        run: |
+          ENVIRONMENT="${{ steps.set-env.outputs.environment }}"
+          STACK_NAME="${{ env.APP_NAME }}-${ENVIRONMENT}"
+          
+          echo "Getting infrastructure outputs for stack: $STACK_NAME"
+          
+          ECR_URI=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`ECRRepositoryURI`].OutputValue' \
+            --output text)
+          
+          ECS_CLUSTER=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`ECSClusterName`].OutputValue' \
+            --output text)
+          
+          ECS_SERVICE=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`ECSServiceName`].OutputValue' \
+            --output text)
+          
+          DATA_BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`DataBucketName`].OutputValue' \
+            --output text)
+          
+          echo "ecr-uri=$ECR_URI" >> $GITHUB_OUTPUT
+          echo "ecs-cluster=$ECS_CLUSTER" >> $GITHUB_OUTPUT
+          echo "ecs-service=$ECS_SERVICE" >> $GITHUB_OUTPUT
+          echo "data-bucket=$DATA_BUCKET" >> $GITHUB_OUTPUT
+
+      - name: Login to Amazon ECR
+        run: |
+          echo "🔐 Logging in to Amazon ECR..."
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login --username AWS --password-stdin ${{ steps.infra.outputs.ecr-uri }}
+
+      - name: Build Docker image
+        run: |
+          echo "🏗️ Building Docker image..."
+          
+          # Build image with multiple tags
+          docker build -t ${{ env.APP_NAME }}:latest \
+            -t ${{ env.APP_NAME }}:${{ github.sha }} \
+            -t ${{ steps.infra.outputs.ecr-uri }}:latest \
+            -t ${{ steps.infra.outputs.ecr-uri }}:${{ github.sha }} \
+            .
+          
+          echo "✅ Docker image built successfully"
+
+      - name: Push Docker image to ECR
+        run: |
+          echo "📤 Pushing Docker image to ECR..."
+          
+          # Push both latest and commit-specific tags
+          docker push ${{ steps.infra.outputs.ecr-uri }}:latest
+          docker push ${{ steps.infra.outputs.ecr-uri }}:${{ github.sha }}
+          
+          echo "✅ Docker image pushed successfully"
+
+      - name: Update ECS service
+        run: |
+          echo "🚀 Updating ECS service..."
+          
+          # Force new deployment to pull latest image
+          aws ecs update-service \
+            --cluster ${{ steps.infra.outputs.ecs-cluster }} \
+            --service ${{ steps.infra.outputs.ecs-service }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+          
+          echo "✅ ECS service update initiated"
+
+      - name: Wait for deployment
+        run: |
+          echo "⏳ Waiting for ECS service to stabilize..."
+          
+          # Wait for service to become stable (max 15 minutes)
+          aws ecs wait services-stable \
+            --cluster ${{ steps.infra.outputs.ecs-cluster }} \
+            --services ${{ steps.infra.outputs.ecs-service }} \
+            --region ${{ env.AWS_REGION }}
+          
+          echo "✅ ECS service is stable"
+
+      - name: Get application URL
+        id: app-url
+        run: |
+          ENVIRONMENT="${{ steps.set-env.outputs.environment }}"
+          STACK_NAME="${{ env.APP_NAME }}-${ENVIRONMENT}"
+          
+          APP_URL=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApplicationURL`].OutputValue' \
+            --output text)
+          
+          echo "app-url=$APP_URL" >> $GITHUB_OUTPUT
+
+      - name: Test deployment
+        run: |
+          echo "🧪 Testing deployment..."
+          
+          # Wait a bit for the service to be ready
+          sleep 30
+          
+          # Test health endpoint
+          if curl -f -s "${{ steps.app-url.outputs.app-url }}/health" > /dev/null; then
+            echo "✅ Health check passed"
+          else
+            echo "⚠️ Health check failed - service may still be starting"
+          fi
+
+      - name: Create deployment summary
+        run: |
+          echo "## 🚀 Application Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ steps.set-env.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** ${{ steps.infra.outputs.ecr-uri }}:${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🌐 Application Access" >> $GITHUB_STEP_SUMMARY
+          echo "- **Application URL:** ${{ steps.app-url.outputs.app-url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Health Check:** ${{ steps.app-url.outputs.app-url }}/health" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 AWS Resources" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECS Cluster:** ${{ steps.infra.outputs.ecs-cluster }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECS Service:** ${{ steps.infra.outputs.ecs-service }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Data Bucket:** ${{ steps.infra.outputs.data-bucket }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
+          echo "- [ECS Service](https://console.aws.amazon.com/ecs/home?region=${{ env.AWS_REGION }}#/clusters/${{ steps.infra.outputs.ecs-cluster }}/services/${{ steps.infra.outputs.ecs-service }}/details)" >> $GITHUB_STEP_SUMMARY
+          echo "- [ECR Repository](https://console.aws.amazon.com/ecr/repositories?region=${{ env.AWS_REGION }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [CloudWatch Logs](https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#logsV2:log-groups)" >> $GITHUB_STEP_SUMMARY
+
+  smoke-test:
+    name: Smoke Tests
+    runs-on: ubuntu-latest
+    needs: build-and-deploy
+    if: github.event_name != 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set environment
+        id: set-env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get application URL
+        id: app-url
+        run: |
+          ENVIRONMENT="${{ steps.set-env.outputs.environment }}"
+          STACK_NAME="${{ env.APP_NAME }}-${ENVIRONMENT}"
+          
+          APP_URL=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApplicationURL`].OutputValue' \
+            --output text)
+          
+          echo "app-url=$APP_URL" >> $GITHUB_OUTPUT
+
+      - name: Run smoke tests
+        env:
+          API_BASE_URL: ${{ steps.app-url.outputs.app-url }}
+        run: |
+          echo "🧪 Running smoke tests against: $API_BASE_URL"
+          
+          # Basic API tests
+          echo "Testing health endpoint..."
+          curl -f "$API_BASE_URL/health" || exit 1
+          
+          echo "Testing todos endpoint..."
+          curl -f "$API_BASE_URL/api/todos" || exit 1
+          
+          echo "✅ Smoke tests passed"

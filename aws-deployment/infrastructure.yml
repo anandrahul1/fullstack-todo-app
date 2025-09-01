@@ -1,0 +1,297 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simplified AWS Infrastructure for Todo App PoC - Uses Default VPC'
+
+Parameters:
+  AppName:
+    Type: String
+    Default: todo-app
+    Description: Application name (used for resource naming)
+  
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+Resources:
+  # ============================================================================
+  # Security Groups (using default VPC)
+  # ============================================================================
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${AppName}-${Environment}-alb-sg
+      GroupDescription: Security group for Application Load Balancer
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-${Environment}-alb-sg
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${AppName}-${Environment}-ecs-sg
+      GroupDescription: Security group for ECS tasks
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-${Environment}-ecs-sg
+
+  # ============================================================================
+  # S3 Bucket for Data Storage
+  # ============================================================================
+
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AppName}-${Environment}-data-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-${Environment}-data-bucket
+
+  # ============================================================================
+  # Application Load Balancer (using default VPC subnets)
+  # ============================================================================
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${AppName}-${Environment}-alb
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-${Environment}-alb
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${AppName}-${Environment}-tg
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-${Environment}-target-group
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ============================================================================
+  # ECR Repository
+  # ============================================================================
+
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${AppName}-${Environment}
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+
+  # ============================================================================
+  # ECS Cluster and Service
+  # ============================================================================
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${AppName}-${Environment}-cluster
+      CapacityProviders:
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub ${DataBucket}/*
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Ref DataBucket
+
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AppName}-${Environment}
+      Cpu: 256
+      Memory: 512
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      TaskRoleArn: !Ref ECSTaskRole
+      ContainerDefinitions:
+        - Name: !Sub ${AppName}-container
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:latest
+          PortMappings:
+            - ContainerPort: 3000
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: PORT
+              Value: '3000'
+            - Name: S3_BUCKET
+              Value: !Ref DataBucket
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub ${AppName}-${Environment}-service
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      TaskDefinition: !Ref ECSTaskDefinition
+      LoadBalancers:
+        - ContainerName: !Sub ${AppName}-container
+          ContainerPort: 3000
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ============================================================================
+  # CloudWatch
+  # ============================================================================
+
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${AppName}-${Environment}
+      RetentionInDays: 7
+
+# ============================================================================
+# Outputs
+# ============================================================================
+
+Outputs:
+  DataBucketName:
+    Description: Data S3 bucket name
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub ${AppName}-${Environment}-data-bucket
+
+  ALBDomainName:
+    Description: Application Load Balancer domain name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub ${AppName}-${Environment}-alb-domain
+
+  ECRRepositoryURI:
+    Description: ECR repository URI
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}
+    Export:
+      Name: !Sub ${AppName}-${Environment}-ecr-uri
+
+  ECSClusterName:
+    Description: ECS cluster name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub ${AppName}-${Environment}-ecs-cluster
+
+  ECSServiceName:
+    Description: ECS service name
+    Value: !GetAtt ECSService.Name
+    Export:
+      Name: !Sub ${AppName}-${Environment}-ecs-service
+
+  ApplicationURL:
+    Description: Application URL
+    Value: !Sub http://${ApplicationLoadBalancer.DNSName}
+    Export:
+      Name: !Sub ${AppName}-${Environment}-app-url
