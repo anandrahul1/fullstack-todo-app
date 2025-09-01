@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run full test suite
+      run: npm run test:all
+    
+    - name: Build release artifacts
+      run: |
+        echo "Building release artifacts..."
+        # Create production build
+        NODE_ENV=production npm run build
+        
+        # Create release package
+        tar -czf todo-app-${{ github.ref_name }}.tar.gz \
+          --exclude=node_modules \
+          --exclude=.git \
+          --exclude=tests \
+          --exclude=coverage \
+          .
+    
+    - name: Generate changelog
+      id: changelog
+      run: |
+        # Generate changelog from commits
+        echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+        git log --pretty=format:"- %s" $(git describe --tags --abbrev=0 HEAD^)..HEAD >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    
+    - name: Create GitHub Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref_name }}
+        release_name: Release ${{ github.ref_name }}
+        body: |
+          ## Changes in this Release
+          ${{ steps.changelog.outputs.CHANGELOG }}
+          
+          ## Installation
+          
+          ```bash
+          # Download and extract
+          wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/todo-app-${{ github.ref_name }}.tar.gz
+          tar -xzf todo-app-${{ github.ref_name }}.tar.gz
+          
+          # Install dependencies
+          npm install --production
+          
+          # Start the application
+          npm start
+          ```
+          
+          ## Docker
+          
+          ```bash
+          docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+          docker run -p 3000:3000 ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+          ```
+        draft: false
+        prerelease: false
+    
+    - name: Upload release assets
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./todo-app-${{ github.ref_name }}.tar.gz
+        asset_name: todo-app-${{ github.ref_name }}.tar.gz
+        asset_content_type: application/gzip
