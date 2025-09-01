@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "name": "Auto Test on Save",
+  "description": "Run tests when JavaScript files are saved",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "**/*.js"
+    ]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "Run appropriate tests for the saved JavaScript file. If it's in models/, services/, or controllers/, run unit tests with 'npm run test:unit'. If it's in public/js/, run frontend tests with 'npm run test:frontend'. Show a brief summary of test results."
+  }
+}
